@@ -11,22 +11,20 @@ sedEscape() {
 }
 
 # To install, curl -fsSl 'url to this script' | sh
+# Or run "./installers/install.sh local" in the repository of the
+# native messanger.
 
 run() {
-    set -e
-
-    XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}/tridactyl"
-    XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}/tridactyl"
-
     # Decide where to put the manifest based on OS
     # Get OSTYPE from bash if it's installed. If it's not, then this will
     # default to the Linux location as OSTYPE will be empty
     OSTYPE="$(command -v bash >/dev/null && bash -c 'echo $OSTYPE')"
+    set -e # we don't really mind if OSTYPE fails (e.g. on Alpine Linux)
+
+    XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}/tridactyl"
+    XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}/tridactyl"
+
     case "$OSTYPE" in
-        linux-gnu|linux-musl|linux|freebsd*)
-            manifest_home="$HOME/.mozilla/native-messaging-hosts/"
-            binary_suffix="Linux"
-            ;;
         linux-gnueabihf)
             manifest_home="$HOME/.mozilla/native-messaging-hosts/"
             binary_suffix="armhf-Linux"
@@ -35,22 +33,34 @@ run() {
             manifest_home="$HOME/Library/Application Support/Mozilla/NativeMessagingHosts/"
             binary_suffix="macOS"
             ;;
-        *)
+        linux-gnu|linux-musl|linux|freebsd*|*)
             # Fallback to default Linux location for unknown OSTYPE
             # TODO: fall back to old Python messenger
+            ARCHITECTURE="$(uname -m)"
             manifest_home="$HOME/.mozilla/native-messaging-hosts/"
-            binary_suffix="Linux"
+            case "$ARCHITECTURE" in
+                aarch64)
+                    binary_suffix="arm64-Linux"
+                    ;;
+                *)
+                    binary_suffix="Linux"
+                    ;;
+            esac
             ;;
     esac
 
-    if [ -n "$1" ] ; then
-        native_version="$(curl -sSL https://raw.githubusercontent.com/tridactyl/tridactyl/"$1"/native/current_native_version 2>/dev/null)"
+    if [ "$1" = "local" ] ; then
+        manifest_loc="file://"$(pwd)"/tridactyl.json"
+        native_loc="file://"$(pwd)"/native_main"
     else
-        native_version="$(curl -sSL https://api.github.com/repos/tridactyl/native_messenger/releases/latest | grep "tag_name" | cut -d':' -f2- | sed 's|[^0-9\.]||g')"
+        if [ -n "$1" ] ; then
+            native_version="$(curl -sSL https://raw.githubusercontent.com/tridactyl/tridactyl/"$1"/native/current_native_version 2>/dev/null)"
+        else
+            native_version="$(curl -sSL https://api.github.com/repos/tridactyl/native_messenger/releases/latest | grep "tag_name" | cut -d':' -f2- | sed 's|[^0-9\.]||g')"
+        fi
+        manifest_loc="https://raw.githubusercontent.com/tridactyl/native_messenger/$native_version/tridactyl.json"
+        native_loc="https://github.com/tridactyl/native_messenger/releases/download/$native_version/native_main-$binary_suffix"
     fi
-    manifest_loc="https://raw.githubusercontent.com/tridactyl/native_messenger/$native_version/tridactyl.json"
-    native_loc="https://github.com/tridactyl/native_messenger/releases/download/$native_version/native_main-$binary_suffix"
-
 
     mkdir -p "$manifest_home" "$XDG_DATA_HOME"
 

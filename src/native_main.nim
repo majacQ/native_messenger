@@ -5,6 +5,8 @@ import streams
 import os
 import strutils
 import posix
+import regex
+import base64
 
 # Third party stuff
 import tempfile
@@ -13,7 +15,7 @@ import tempfile
 when defined(windows):
     import windows_helpers
 
-const VERSION = "0.3.5"
+const VERSION = "0.5.0"
 
 type
     MessageRecv* = object
@@ -82,26 +84,54 @@ proc getMessage(strm: Stream): MessageRecv =
 
 
 proc findUserConfigFile(): string =
-    let candidateFiles =
+    # The standard config dir is the same as stdlib, except on Windows where we also allow `XDG_CONFIG_HOME` when set.
+    let standardConfigDir =
         when not defined(windows):
-            [
-                getConfigDir() / "tridactyl" / "tridactylrc",
-                getHomeDir() / ".config" / "tridactyl" / "tridactylrc",
-                getHomeDir() / "_config" / "tridactyl" / "tridactylrc",
-                getHomeDir() / ".tridactylrc",
-                getHomeDir() / "_tridactylrc",
-            ]
+            getConfigDir()
         else:
-            [
-                getHomeDir() / ".config" / "tridactyl" / "tridactylrc",
-                getHomeDir() / "_config" / "tridactyl" / "tridactylrc",
-                getHomeDir() / ".tridactylrc",
-                getHomeDir() / "_tridactylrc",
-            ]
+            getEnv("XDG_CONFIG_HOME", getConfigDir())
+
+    let candidateFiles =
+        [
+            standardConfigDir / "tridactyl" / "tridactylrc",
+            getHomeDir() / ".config" / "tridactyl" / "tridactylrc",
+            getHomeDir() / "_config" / "tridactyl" / "tridactylrc",
+            getHomeDir() / ".tridactylrc",
+            getHomeDir() / "_tridactylrc",
+        ]
 
     for path in candidateFiles:
         if fileExists(path):
             return path
+
+proc expandVars(path: string): string =
+    result = path
+    when defined(posix):
+        if "$" notin result:
+            return
+
+        var
+            name, value, tail: string
+            (first, last) = (0, 0)
+        while true:
+            var bounds_slices = findAllBounds(result, re"\$(\w+|\{[^}]*\})", first)
+            if bounds_slices.len == 0:
+                break
+            (first, last) = (bounds_slices[0].a, bounds_slices[0].b)
+            if first < 0 or last < first:
+                break
+            name = result[first + 1 .. last]
+            if name.startsWith('{') and name.endsWith('}'):
+                name = name[1 .. ^2]
+            if existsEnv(name):
+                value = getEnv(name)
+            else:
+                first = last
+                continue
+            tail = result[last + 1 .. ^1]
+            result = result[0 .. first - 1] & value
+            first = len(result)
+            result = result & tail
 
 proc handleMessage(msg: MessageRecv): MessageResp =
     let cmd = msg.cmd.get()
@@ -140,9 +170,12 @@ proc handleMessage(msg: MessageRecv): MessageResp =
             result.command = some command
             let process = startProcess(command, options = {poEvalCommand,
                     poStdErrToStdOut})
+            if msg.content.isSome:
+                process.inputStream.write(msg.content.get())
+                process.inputStream.close()
 
             var content = ""
-            for line in process.lines:
+            for line in process.outputStream.lines:
                 content.add(line)
                 content.add('\n')
             result.content = some content
@@ -169,7 +202,7 @@ proc handleMessage(msg: MessageRecv): MessageResp =
 
         of "read":
             var f: File
-            if open(f, expandTilde(msg.file.get())):
+            if open(f, expandTilde(expandVars(msg.file.get()))):
                 result.content = some(readAll(f))
                 result.code = some(0)
                 close(f)
@@ -179,15 +212,15 @@ proc handleMessage(msg: MessageRecv): MessageResp =
 
         of "mkdir":
             try:
-                createDir(expandTilde(msg.dir.get()))
+                createDir(expandTilde(expandVars((msg.dir.get()))))
                 result.content = some("")
                 result.code = some(0)
             except OSError:
                 result.code = some(2)
 
         of "move":
-            let src = expandTilde(msg.`from`.get())
-            let dst = expandTilde(msg.to.get())
+            let src = expandTilde(expandVars(msg.`from`.get()))
+            let dst = expandTilde(expandVars(msg.to.get()))
             let canMove = msg.overwrite.get(false) or not(fileExists(dst) or
                     fileExists(joinPath(dst, extractFilename(src))))
 
@@ -206,7 +239,10 @@ proc handleMessage(msg: MessageRecv): MessageResp =
                         if result.code != some 0:
                             raise newException(OSError, "\"" & mvCmd & "\" failed on MacOS ...")
                     else:
-                        moveFile(src, dst)
+                        if dirExists dst:
+                            moveFile(src, dst / extractFilename(src))
+                        else:
+                            moveFile(src, dst)
                         result.code = some(0)
                 except OSError:
                     result.code = some(2)
@@ -228,15 +264,19 @@ proc handleMessage(msg: MessageRecv): MessageResp =
         of "write":
             try:
                 var f: File
-                discard open(f, expandTilde(msg.file.get()), fmWrite)
-                write(f, msg.content.get())
+                discard open(f, expandTilde(expandVars(msg.file.get())), fmWrite)
+                var msgContent = msg.content.get()
+                let expr = re"^data:((.*?)(;charset=.*?)?)(;base64)?,"
+                if match(msgContent, expr):
+                    msgContent = decode(replace(msgContent, expr, ""))
+                write(f, msgContent)
                 result.code = some(0)
                 close(f)
             except IOError:
                 result.code = some(2)
 
         of "writerc":
-            let path = expandTilde(msg.file.get())
+            let path = expandTilde(expandVars(msg.file.get()))
             if not fileExists(path) or msg.force.get(false):
                 try:
                     var f: File
